@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import threading
+import html
 from pathlib import Path
 from typing import Optional
 
@@ -176,24 +177,44 @@ def _drive_download(file_id, destination):
         raise
 
 
-def _drive_upload(local_path, drive_name, existing_id=None):
+def _drive_upload(local_path, drive_name, existing_id=None, progress=None,
+                  progress_start=0.0, progress_end=1.0):
+    """Upload a file to Drive, optionally reporting resumable-upload progress."""
     service = _drive_client()
     if service is None:
         return None
+
     from googleapiclient.http import MediaFileUpload
-    mime = "application/octet-stream"
-    media = MediaFileUpload(str(local_path), mimetype=mime, resumable=True)
+    media = MediaFileUpload(
+        str(local_path),
+        mimetype="application/octet-stream",
+        resumable=True,
+        chunksize=1024 * 1024
+    )
     if existing_id:
-        result = service.files().update(
-            fileId=existing_id, body={"name": drive_name}, media_body=media,
+        request = service.files().update(
+            fileId=existing_id,
+            body={"name": drive_name},
+            media_body=media,
             fields="id,name"
-        ).execute()
+        )
     else:
-        result = service.files().create(
+        request = service.files().create(
             body={"name": drive_name, "parents": [_drive_folder_id]},
-            media_body=media, fields="id,name"
-        ).execute()
-    return result.get("id")
+            media_body=media,
+            fields="id,name"
+        )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status is not None and progress is not None:
+            fraction = float(status.progress())
+            progress(
+                progress_start + (progress_end - progress_start) * fraction,
+                desc=f"Uploading {drive_name} to Google Drive..."
+            )
+    return response.get("id")
 
 
 def _drive_delete(file_id):
@@ -388,17 +409,28 @@ def _save_manifest():
     MANIFEST_PATH.write_text(json.dumps(_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _build_index():
+def _build_index(progress=None):
+    """Extract documents and rebuild the semantic search index with progress updates."""
     global _index, _chunks
     all_chunks = []
     manifest_files = []
-    for path in sorted(DOCS_DIR.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in ALLOWED_EXTENSIONS:
-            continue
+    paths = [
+        path for path in sorted(DOCS_DIR.iterdir())
+        if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS
+    ]
+
+    if progress is not None:
+        progress(0.38, desc=f"Reading text from {len(paths)} document(s)...")
+
+    for i, path in enumerate(paths, start=1):
         try:
             text = _extract_text(path)
             if not text.strip():
-                manifest_files.append({"name": path.name, "status": "No extractable text", "chunks": 0})
+                manifest_files.append({
+                    "name": path.name,
+                    "status": "No extractable text",
+                    "chunks": 0
+                })
                 continue
             parts = _split_text(text)
             for number, part in enumerate(parts, start=1):
@@ -408,11 +440,23 @@ def _build_index():
                     "text": part
                 })
             manifest_files.append({
-                "name": path.name, "status": "Indexed", "chunks": len(parts),
+                "name": path.name,
+                "status": "Reading text complete",
+                "chunks": len(parts),
                 "size_bytes": path.stat().st_size
             })
         except Exception as exc:
-            manifest_files.append({"name": path.name, "status": f"Error: {exc}", "chunks": 0})
+            manifest_files.append({
+                "name": path.name,
+                "status": f"Error: {exc}",
+                "chunks": 0
+            })
+        if progress is not None:
+            progress(
+                0.38 + 0.17 * (i / max(1, len(paths))),
+                desc=f"Reading document {i}/{len(paths)}: {path.name}"
+            )
+
     _chunks = all_chunks
     _manifest = {"files": manifest_files}
     _save_manifest()
@@ -423,20 +467,36 @@ def _build_index():
             INDEX_PATH.unlink()
         if CHUNKS_PATH.exists():
             CHUNKS_PATH.unlink()
+        if progress is not None:
+            progress(0.96, desc="No searchable text found; saving document statuses...")
         _drive_save_state()
         return
 
+    if progress is not None:
+        progress(0.57, desc=f"Loading embedding model for {len(all_chunks)} text sections...")
     embs = _get_embedding_model().encode(
         [c["text"] for c in all_chunks],
         convert_to_numpy=True,
         normalize_embeddings=True,
-        show_progress_bar=False
+        show_progress_bar=True
     ).astype("float32")
+
     _index = faiss.IndexFlatIP(embs.shape[1])
     _index.add(embs)
     faiss.write_index(_index, str(INDEX_PATH))
     CHUNKS_PATH.write_text(json.dumps(_chunks, ensure_ascii=False), encoding="utf-8")
+
+    # Mark successfully extracted documents as indexed only after embeddings are ready.
+    for entry in _manifest["files"]:
+        if entry.get("chunks", 0) > 0 and entry.get("status") == "Reading text complete":
+            entry["status"] = "Indexed"
+    _save_manifest()
+
+    if progress is not None:
+        progress(0.94, desc="Saving index and syncing Google Drive...")
     _drive_save_state()
+    if progress is not None:
+        progress(1.0, desc="Knowledge base ready.")
 
 
 def _get_embedding_model():
@@ -539,24 +599,42 @@ def _answer(question: str, top_k: int = TOP_K):
         return answer, source_text
 
 
-def _save_uploaded(files):
-    """Add files, skip exact duplicate names unless the admin deletes/replaces first."""
+def _save_uploaded(files, progress=None):
+    """Save selected documents and report copy, Drive-upload and indexing progress."""
     if not files:
         return "Choose one or more PDF, DOCX, or TXT files first.", _documents_table()
+
     added, skipped, errors = [], [], []
+    file_count = len(files)
+
+    if progress is not None:
+        progress(0.03, desc="Preparing selected documents...")
+
     with _lock:
-        for file_obj in files:
+        for i, file_obj in enumerate(files, start=1):
             source_path = Path(getattr(file_obj, "name", str(file_obj)))
+            if progress is not None:
+                progress(
+                    0.05 + 0.15 * ((i - 1) / max(1, file_count)),
+                    desc=f"Checking file {i}/{file_count}: {source_path.name}"
+                )
             if source_path.suffix.lower() not in ALLOWED_EXTENSIONS:
                 errors.append(f"{source_path.name}: unsupported file type")
                 continue
-            if source_path.stat().st_size > MAX_FILE_MB * 1024 * 1024:
+            try:
+                file_size = source_path.stat().st_size
+            except OSError as exc:
+                errors.append(f"{source_path.name}: cannot read selected file: {exc}")
+                continue
+            if file_size > MAX_FILE_MB * 1024 * 1024:
                 errors.append(f"{source_path.name}: exceeds {MAX_FILE_MB} MB limit")
                 continue
+
             target = DOCS_DIR / source_path.name
             if target.exists():
                 skipped.append(source_path.name)
                 continue
+
             try:
                 shutil.copy2(source_path, target)
                 added.append(target.name)
@@ -564,11 +642,19 @@ def _save_uploaded(files):
                 errors.append(f"{source_path.name}: could not copy file: {exc}")
                 continue
 
-            # Index locally even if Drive permissions/storage are not configured.
+            # Drive upload is resumable, so progress reflects bytes sent to Drive.
             service = _drive_client()
             if service is not None:
                 try:
-                    _drive_upload(target, "doc__" + target.name)
+                    file_start = 0.20 + 0.16 * ((i - 1) / max(1, file_count))
+                    file_end = 0.20 + 0.16 * (i / max(1, file_count))
+                    _drive_upload(
+                        target,
+                        "doc__" + target.name,
+                        progress=progress,
+                        progress_start=file_start,
+                        progress_end=file_end
+                    )
                 except Exception as exc:
                     errors.append(
                         f"Google Drive save failed for {target.name}. Verify "
@@ -576,13 +662,29 @@ def _save_uploaded(files):
                         "service-account client_email. The local file will still be indexed. "
                         f"Details: {exc}"
                     )
+
         if added:
-            _build_index()
+            _build_index(progress=progress)
+        elif progress is not None:
+            progress(0.98, desc="No new files to index; refreshing document list...")
+
     messages = []
-    if added: messages.append("Added and indexed: " + ", ".join(added))
-    if skipped: messages.append("Skipped existing filenames (delete first to replace): " + ", ".join(skipped))
-    if errors: messages.append("Errors: " + "; ".join(errors))
-    if not messages: messages.append("No changes made.")
+    if added:
+        messages.append("Added locally and processed: " + ", ".join(added))
+    if skipped:
+        messages.append("Skipped duplicate filenames (delete the existing file first to replace it): " + ", ".join(skipped))
+    if errors:
+        messages.append("Warnings / errors: " + "; ".join(errors))
+
+    status_map = {item.get("name"): item.get("status") for item in _manifest.get("files", [])}
+    for filename in added:
+        file_status = status_map.get(filename)
+        if file_status and file_status != "Indexed":
+            messages.append(f"{filename}: {file_status}")
+    if not messages:
+        messages.append("No changes made.")
+    if progress is not None:
+        progress(1.0, desc="Finished.")
     return "\n".join(messages), _documents_table()
 
 
@@ -657,25 +759,40 @@ def chat_fn(message, history):
     return full
 
 
-def admin_upload(files):
-    message, _records = _save_uploaded(files)
-    return message, _documents_table_rows()
+def admin_upload(files, progress=gr.Progress(track_tqdm=True)):
+    message, records = _save_uploaded(files, progress=progress)
+    return message, records
 
 
 def admin_delete(filename):
     message, _records = _delete_document(filename)
-    return message, _documents_table_rows()
+    return message, _documents_table()
 
 
-def admin_refresh():
+def admin_refresh(progress=gr.Progress(track_tqdm=True)):
     _records, message = _refresh_from_drive()
-    return _documents_table_rows(), message
+    if progress is not None:
+        progress(1.0, desc="Drive sync complete.")
+    return message, _documents_table()
 
 
 # Initialise storage/index on app startup.
 _initialise()
 
-with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple")) as demo:
+APP_CSS = """
+:root { --qw-primary: #8b5cf6; --qw-border: #e5e7eb; }
+.gradio-container { max-width: 1180px !important; }
+.upload-panel { border: 1px solid var(--qw-border); border-radius: 18px; padding: 18px; background: #fbfaff; }
+.document-library { border: 1px solid var(--qw-border); border-radius: 16px; padding: 12px; background: white; }
+.document-card { align-items: center !important; border: 1px solid #ece8f5; border-radius: 12px; padding: 12px 14px; margin: 8px 0; background: #fff; }
+.doc-file-icon { font-size: 26px; width: 46px; height: 46px; display: flex; align-items: center; justify-content: center; border-radius: 12px; background: #f3e8ff; }
+.doc-file-name { font-size: 15px; font-weight: 650; color: #27233a; overflow-wrap: anywhere; }
+.doc-file-subtitle { font-size: 12px; color: #716b80; margin-top: 5px; overflow-wrap: anywhere; }
+.doc-icon-wrap, .doc-details-wrap { min-width: 0 !important; }
+button { border-radius: 10px !important; }
+"""
+
+with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple"), css=APP_CSS) as demo:
     gr.Markdown(
         "# Qwivaro AI Assistant\n"
         "Ask questions about the uploaded ERP documentation. Answers are generated from retrieved document sections."
@@ -694,51 +811,82 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple")) as d
         )
     with gr.Tab("Knowledge Base (Admin)"):
         gr.Markdown(
-            "### Manage documents\n"
-            "Upload PDF, DOCX or TXT files. New documents are indexed and added to the knowledge base. "
-            "Files with duplicate names are skipped; delete the old file first if you want to replace it."
+            "## Document library\n"
+            "Upload manuals, see every stored file and remove a document directly from its row."
         )
-        with gr.Row():
-            upload_input = gr.File(
-                label="Select documents",
-                file_count="multiple",
-                file_types=[".pdf", ".docx", ".txt"],
-                type="filepath"
-            )
-            upload_button = gr.Button("Upload and Index", variant="primary")
-        upload_status = gr.Textbox(label="Upload status", interactive=False)
-        docs_table = gr.Dataframe(
-            headers=["Filename", "Size (KB)", "Status"],
-            datatype=["str", "number", "str"],
-            value=_documents_table_rows,
+        with gr.Row(equal_height=True, elem_classes=["upload-panel"]):
+            with gr.Column(scale=3, min_width=300):
+                upload_input = gr.File(
+                    label="1 · Select PDF, DOCX or TXT documents",
+                    file_count="multiple",
+                    file_types=[".pdf", ".docx", ".txt"],
+                    type="filepath",
+                    height=150
+                )
+                gr.Markdown(
+                    "Files are sent to this app when selected. The progress indicator tracks "
+                    "Drive transfer (when configured), text extraction and indexing."
+                )
+            with gr.Column(scale=2, min_width=240):
+                gr.Markdown("### Add to knowledge base\nAfter selecting files, start processing. Duplicate names are skipped.")
+                upload_button = gr.Button("Upload and index documents", variant="primary", size="lg")
+                refresh_button = gr.Button("↻ Sync existing files from Google Drive", variant="secondary")
+        upload_status = gr.Textbox(
+            label="Activity and document status",
             interactive=False,
-            label="Stored documents"
+            lines=3,
+            placeholder="Upload progress and results will appear here..."
         )
-        with gr.Row():
-            delete_name = gr.Dropdown(
-                choices=[x["Filename"] for x in _documents_table()],
-                label="Select document to delete",
-                allow_custom_value=False
-            )
-            delete_button = gr.Button("Delete selected document", variant="stop")
-        refresh_button = gr.Button("Refresh / Sync from Google Drive")
+        documents_state = gr.State(_documents_table())
+        gr.Markdown("## Uploaded documents")
+        gr.Markdown("Each document shows its size and indexing status, with a dedicated delete button.")
+        with gr.Group(elem_classes=["document-library"]):
+            @gr.render(inputs=documents_state)
+            def render_document_library(records):
+                if not records:
+                    gr.Markdown(
+                        "### Your document library is empty\n"
+                        "Select a PDF, DOCX or TXT file above to get started."
+                    )
+                else:
+                    for record in records:
+                        filename = record.get("Filename", "Unnamed document")
+                        size_kb = record.get("Size (KB)", 0)
+                        doc_status = record.get("Status", "Stored")
+                        with gr.Row(equal_height=True, elem_classes=["document-card"]):
+                            gr.HTML(
+                                "<div class='doc-file-icon'>📄</div>",
+                                elem_classes=["doc-icon-wrap"]
+                            )
+                            gr.HTML(
+                                "<div class='doc-file-details'>"
+                                f"<div class='doc-file-name'>{html.escape(str(filename))}</div>"
+                                f"<div class='doc-file-subtitle'>{float(size_kb):,.1f} KB · "
+                                f"{html.escape(str(doc_status))}</div></div>",
+                                elem_classes=["doc-details-wrap"]
+                            )
+                            delete_doc_button = gr.Button(
+                                "Delete", variant="stop", size="sm"
+                            )
+                            delete_doc_button.click(
+                                fn=lambda name=filename: admin_delete(name),
+                                inputs=[],
+                                outputs=[upload_status, documents_state]
+                            )
         upload_button.click(
-            admin_upload, inputs=[upload_input], outputs=[upload_status, docs_table]
+            admin_upload,
+            inputs=[upload_input],
+            outputs=[upload_status, documents_state],
+            show_progress="full"
         ).then(
-            lambda: gr.update(choices=[x["Filename"] for x in _documents_table()], value=None),
-            outputs=[delete_name]
-        )
-        delete_button.click(
-            admin_delete, inputs=[delete_name], outputs=[upload_status, docs_table]
-        ).then(
-            lambda: gr.update(choices=[x["Filename"] for x in _documents_table()], value=None),
-            outputs=[delete_name]
+            lambda: None,
+            outputs=[upload_input]
         )
         refresh_button.click(
-            admin_refresh, outputs=[docs_table, upload_status]
-        ).then(
-            lambda: gr.update(choices=[x["Filename"] for x in _documents_table()], value=None),
-            outputs=[delete_name]
+            admin_refresh,
+            inputs=[],
+            outputs=[upload_status, documents_state],
+            show_progress="full"
         )
     gr.Markdown(
         "---\n"
