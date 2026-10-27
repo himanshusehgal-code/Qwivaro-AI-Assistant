@@ -90,7 +90,12 @@ def _drive_list():
         page_token = response.get("nextPageToken")
         if not page_token:
             break
-    return results
+    # The configured folder and subfolders are not documents to download.
+    return [
+        item for item in results
+        if item.get("id") != _drive_folder_id
+        and item.get("mimeType") != "application/vnd.google-apps.folder"
+    ]
 
 
 def _drive_download(file_id, destination):
@@ -135,11 +140,25 @@ def _drive_delete(file_id):
 
 
 def _sync_from_drive():
-    """Download original documents and saved index/metadata from Drive to local disk."""
+    """Download saved state and all supported documents from the configured Drive folder.
+
+    Files uploaded from this app use a doc__ prefix; documents that were already
+    present in Drive before the app was connected are also imported.
+    Returns True if a source document was newly downloaded or replaced.
+    """
     service = _drive_client()
     if service is None:
-        return
-    files = _drive_list()
+        return False
+
+    try:
+        files = _drive_list()
+    except Exception as exc:
+        print(
+            "Google Drive sync failed. Check GOOGLE_DRIVE_FOLDER_ID and share "
+            "the folder with the service-account client_email: " + str(exc)
+        )
+        return False
+
     by_name = {f["name"]: f for f in files}
     # Restore saved index and metadata if present.
     for name, dest in [
@@ -152,25 +171,62 @@ def _sync_from_drive():
                 _drive_download(by_name[name]["id"], dest)
             except Exception as exc:
                 print(f"Could not restore {name}: {exc}")
-    # Restore source documents stored with prefix doc__
-    for f in files:
-        if f["name"].startswith("doc__"):
-            original = f["name"][5:]
-            if Path(original).suffix.lower() not in ALLOWED_EXTENSIONS:
-                continue
-            destination = DOCS_DIR / original
-            try:
-                if not destination.exists() or destination.stat().st_size != int(f.get("size") or 0):
-                    _drive_download(f["id"], destination)
-            except Exception as exc:
-                print(f"Could not restore document {original}: {exc}")
+
+    # Import both app-managed and pre-existing PDFs/DOCX/TXT files. If both
+    # exist with the same original name, prefer the app-managed doc__ copy.
+    source_files = {}
+    for item in files:
+        remote_name = item.get("name", "")
+        if remote_name.startswith("doc__"):
+            original = remote_name[5:]
+            preferred = True
+        else:
+            original = remote_name
+            preferred = False
+        if Path(original).suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+        previous = source_files.get(original)
+        if previous is None or preferred:
+            source_files[original] = item
+
+    documents_changed = False
+    for original, item in source_files.items():
+        destination = DOCS_DIR / original
+        remote_size = int(item.get("size") or 0)
+        needs_download = (
+            not destination.exists()
+            or (remote_size > 0 and destination.stat().st_size != remote_size)
+        )
+        if not needs_download:
+            continue
+        try:
+            if item.get("id") == _drive_folder_id:
+                raise ValueError(
+                    "Google Drive returned the folder ID as a file. Verify "
+                    "GOOGLE_DRIVE_FOLDER_ID and folder sharing permissions."
+                )
+            _drive_download(item["id"], destination)
+            documents_changed = True
+            print(f"Restored existing Drive document: {original}")
+        except Exception as exc:
+            print(f"Could not restore document {original}: {exc}")
+
+    return documents_changed
 
 
 def _drive_save_state():
     service = _drive_client()
     if service is None:
         return
-    files = _drive_list()
+    try:
+        files = _drive_list()
+    except Exception as exc:
+        print(
+            "Could not list Google Drive folder; check the folder ID and share "
+            "it with the service-account client_email: " + str(exc)
+        )
+        return
+
     by_name = {f["name"]: f for f in files}
     for local_path, drive_name in [
         (INDEX_PATH, "qwivaro_faiss.index"),
@@ -178,7 +234,10 @@ def _drive_save_state():
         (MANIFEST_PATH, "qwivaro_manifest.json"),
     ]:
         if local_path.exists():
-            _drive_upload(local_path, drive_name, by_name.get(drive_name, {}).get("id"))
+            try:
+                _drive_upload(local_path, drive_name, by_name.get(drive_name, {}).get("id"))
+            except Exception as exc:
+                print(f"Could not save {drive_name} to Google Drive: {exc}")
 
 
 def _extract_text(path: Path) -> str:
@@ -291,6 +350,14 @@ def _get_embedding_model():
     return _embedding_model
 
 
+def _documents_table_rows():
+    """Return row arrays instead of dictionaries for the Gradio Dataframe."""
+    return [
+        [item["Filename"], item["Size (KB)"], item["Status"]]
+        for item in _documents_table()
+    ]
+
+
 def _load_saved_index():
     global _index, _chunks
     if INDEX_PATH.exists() and CHUNKS_PATH.exists():
@@ -396,13 +463,23 @@ def _save_uploaded(files):
                 continue
             try:
                 shutil.copy2(source_path, target)
-                # If Drive is configured, save original immediately.
-                service = _drive_client()
-                if service is not None:
-                    _drive_upload(target, "doc__" + target.name)
                 added.append(target.name)
             except Exception as exc:
-                errors.append(f"{source_path.name}: {exc}")
+                errors.append(f"{source_path.name}: could not copy file: {exc}")
+                continue
+
+            # Index locally even if Drive permissions/storage are not configured.
+            service = _drive_client()
+            if service is not None:
+                try:
+                    _drive_upload(target, "doc__" + target.name)
+                except Exception as exc:
+                    errors.append(
+                        f"Google Drive save failed for {target.name}. Verify "
+                        "GOOGLE_DRIVE_FOLDER_ID and share the folder with the "
+                        "service-account client_email. The local file will still be indexed. "
+                        f"Details: {exc}"
+                    )
         if added:
             _build_index()
     messages = []
@@ -451,17 +528,23 @@ def _documents_table():
 
 def _refresh_from_drive():
     with _lock:
-        _sync_from_drive()
+        documents_changed = _sync_from_drive()
         _load_manifest()
-        _load_saved_index()
-    return _documents_table(), "Synced from Google Drive (if configured)."
+        if documents_changed:
+            _build_index()
+        else:
+            _load_saved_index()
+    return _documents_table(), "Google Drive sync checked for existing PDF, DOCX and TXT files."
 
 
 def _initialise():
     with _lock:
-        _sync_from_drive()
+        documents_changed = _sync_from_drive()
         _load_manifest()
-        _load_saved_index()
+        if documents_changed:
+            _build_index()
+        else:
+            _load_saved_index()
 
 
 def chat_fn(message, history):
@@ -473,16 +556,18 @@ def chat_fn(message, history):
 
 
 def admin_upload(files):
-    return _save_uploaded(files)
+    message, _records = _save_uploaded(files)
+    return message, _documents_table_rows()
 
 
 def admin_delete(filename):
-    return _delete_document(filename)
+    message, _records = _delete_document(filename)
+    return message, _documents_table_rows()
 
 
 def admin_refresh():
-    table, message = _refresh_from_drive()
-    return table, message
+    _records, message = _refresh_from_drive()
+    return _documents_table_rows(), message
 
 
 # Initialise storage/index on app startup.
@@ -523,7 +608,7 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple")) as d
         docs_table = gr.Dataframe(
             headers=["Filename", "Size (KB)", "Status"],
             datatype=["str", "number", "str"],
-            value=_documents_table,
+            value=_documents_table_rows,
             interactive=False,
             label="Stored documents"
         )
