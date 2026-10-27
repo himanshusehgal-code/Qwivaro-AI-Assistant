@@ -80,43 +80,100 @@ def _drive_client():
 
 
 def _drive_list():
+    """List actual files inside the configured folder and validate folder access."""
     service = _drive_client()
     if service is None:
         return []
+
+    if not _drive_folder_id:
+        raise ValueError("GOOGLE_DRIVE_FOLDER_ID is empty in Render Environment.")
+
+    # Validate that this is a folder ID accessible to this service account.
+    # Google Drive can return 404 when the ID is invalid or not shared with it.
+    folder = service.files().get(
+        fileId=_drive_folder_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True
+    ).execute()
+
+    if folder.get("mimeType") != "application/vnd.google-apps.folder":
+        raise ValueError(
+            f"GOOGLE_DRIVE_FOLDER_ID points to '{folder.get('name', 'unknown')}', "
+            "not a Google Drive folder. Copy the ID from the folder URL."
+        )
+
     results = []
     page_token = None
     while True:
         response = service.files().list(
             q=f"'{_drive_folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id,name,mimeType,size,modifiedTime)",
+            fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,parents)",
             pageSize=100,
-            pageToken=page_token
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         results.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
         if not page_token:
             break
-    # The configured folder and subfolders are not documents to download.
+
+    # Only direct children are listed; never download a folder as though it were a PDF.
     return [
         item for item in results
         if item.get("id") != _drive_folder_id
         and item.get("mimeType") != "application/vnd.google-apps.folder"
+        and _drive_folder_id in item.get("parents", [])
     ]
 
 
 def _drive_download(file_id, destination):
+    """Download one real Drive file to a temporary path, then atomically replace."""
     service = _drive_client()
     if service is None:
-        return False
+        raise RuntimeError(
+            "Google Drive is not configured. Check GOOGLE_DRIVE_FOLDER_ID and "
+            "GOOGLE_SERVICE_ACCOUNT_JSON in Render Environment."
+        )
+    if not file_id or file_id == _drive_folder_id:
+        raise ValueError(
+            "Attempted to download the configured folder ID as a file. "
+            "Only the individual PDF/DOCX/TXT file ID should be downloaded."
+        )
+
+    metadata = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType",
+        supportsAllDrives=True
+    ).execute()
+    if metadata.get("mimeType") == "application/vnd.google-apps.folder":
+        raise ValueError(
+            f"'{metadata.get('name', file_id)}' is a folder, not a document."
+        )
+
     from googleapiclient.http import MediaIoBaseDownload
-    import io
-    request = service.files().get_media(fileId=file_id)
-    with open(destination, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-    return True
+    destination = Path(destination)
+    temporary_path = destination.with_name(destination.name + ".download-tmp")
+    try:
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True
+        )
+        with open(temporary_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        if temporary_path.stat().st_size == 0:
+            raise ValueError(f"Google Drive returned an empty file for {metadata.get('name', file_id)}.")
+        temporary_path.replace(destination)
+        return True
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _drive_upload(local_path, drive_name, existing_id=None):
@@ -257,15 +314,38 @@ def _drive_save_state():
 
 
 def _extract_text(path: Path) -> str:
+    """Extract readable text from text-based PDF, DOCX, and TXT files."""
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        reader = PdfReader(str(path))
-        pieces = []
-        for page_no, page in enumerate(reader.pages, start=1):
-            txt = page.extract_text() or ""
-            if txt.strip():
-                pieces.append(f"[Page {page_no}]\n{txt}")
-        return "\n\n".join(pieces)
+        try:
+            reader = PdfReader(str(path), strict=False)
+            if reader.is_encrypted:
+                try:
+                    reader.decrypt("")
+                except Exception as exc:
+                    raise ValueError("PDF is password-protected and cannot be read.") from exc
+
+            pieces = []
+            for page_no, page in enumerate(reader.pages, start=1):
+                try:
+                    txt = page.extract_text(extraction_mode="layout") or ""
+                except TypeError:
+                    # Compatibility with older pypdf releases.
+                    txt = page.extract_text() or ""
+                if txt.strip():
+                    pieces.append(f"[Page {page_no}]\n{txt.strip()}")
+
+            extracted = "\n\n".join(pieces).strip()
+            if not extracted:
+                raise ValueError(
+                    "No selectable text was found in this PDF. It may be a scanned/image-only PDF; "
+                    "OCR is required for that file."
+                )
+            return extracted
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Could not parse this PDF: {exc}") from exc
     if suffix == ".docx":
         doc = Document(str(path))
         pieces = [p.text for p in doc.paragraphs if p.text.strip()]
