@@ -474,13 +474,30 @@ def _build_index(progress=None):
 
     if progress is not None:
         progress(0.57, desc=f"Loading embedding model for {len(all_chunks)} text sections...")
-    embs = _get_embedding_model().encode(
-        [c["text"] for c in all_chunks],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=True
-    ).astype("float32")
+    embedding_model = _get_embedding_model()
 
+    # Encode in batches so the UI progress advances during long indexing runs,
+    # and the app doesn't need to hold a second full-size batch in memory.
+    text_items = [c["text"] for c in all_chunks]
+    batch_size = 8
+    embedding_batches = []
+    total_batches = max(1, (len(text_items) + batch_size - 1) // batch_size)
+    for batch_number, start in enumerate(range(0, len(text_items), batch_size), start=1):
+        batch_vectors = embedding_model.encode(
+            text_items[start:start + batch_size],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False
+        ).astype("float32")
+        embedding_batches.append(batch_vectors)
+        if progress is not None:
+            fraction = batch_number / total_batches
+            progress(
+                0.58 + 0.32 * fraction,
+                desc=f"Creating search index: batch {batch_number}/{total_batches}"
+            )
+
+    embs = np.concatenate(embedding_batches, axis=0) if embedding_batches else np.empty((0, 0), dtype="float32")
     _index = faiss.IndexFlatIP(embs.shape[1])
     _index.add(embs)
     faiss.write_index(_index, str(INDEX_PATH))
