@@ -217,7 +217,6 @@ def _sync_from_drive():
 
     by_name = {item["name"]: item for item in files}
     for name, destination in [
-        ("qwivaro_faiss.index", INDEX_PATH),
         ("qwivaro_chunks.json", CHUNKS_PATH),
         ("qwivaro_manifest.json", MANIFEST_PATH),
     ]:
@@ -627,7 +626,9 @@ def _documents_table_rows():
 def _refresh_from_drive():
     global _drive_last_error
     with _lock:
-        _changed, sync_error = _sync_from_drive()
+        _sync_from_drive()
+        sync_error = _drive_last_error
+        _load_manifest()
         _build_index()
         message = (
             f"Google Drive sync complete. Indexed {_manifest.get('chunk_count', 0)} text sections."
@@ -648,11 +649,8 @@ def _initialise():
 
 
 def chat_fn(message, history):
-    answer, sources = _answer(message)
-    full = answer
-    if sources:
-        full += "\n\n" + sources
-    return full
+    # _answer returns a single user-facing string, including source names when available.
+    return _answer(message)
 
 
 def admin_upload(files, progress=gr.Progress(track_tqdm=True)):
