@@ -85,18 +85,14 @@ def _drive_list():
     service = _drive_client()
     if service is None:
         return []
-
     if not _drive_folder_id:
         raise ValueError("GOOGLE_DRIVE_FOLDER_ID is empty in Render Environment.")
 
-    # Validate that this is a folder ID accessible to this service account.
-    # Google Drive can return 404 when the ID is invalid or not shared with it.
     folder = service.files().get(
         fileId=_drive_folder_id,
         fields="id,name,mimeType",
         supportsAllDrives=True
     ).execute()
-
     if folder.get("mimeType") != "application/vnd.google-apps.folder":
         raise ValueError(
             f"GOOGLE_DRIVE_FOLDER_ID points to '{folder.get('name', 'unknown')}', "
@@ -119,7 +115,6 @@ def _drive_list():
         if not page_token:
             break
 
-    # Only direct children are listed; never download a folder as though it were a PDF.
     return [
         item for item in results
         if item.get("id") != _drive_folder_id
@@ -129,7 +124,7 @@ def _drive_list():
 
 
 def _drive_download(file_id, destination):
-    """Download one real Drive file to a temporary path, then atomically replace."""
+    """Download one actual Drive file to a temporary path, then atomically replace."""
     service = _drive_client()
     if service is None:
         raise RuntimeError(
@@ -137,29 +132,19 @@ def _drive_download(file_id, destination):
             "GOOGLE_SERVICE_ACCOUNT_JSON in Render Environment."
         )
     if not file_id or file_id == _drive_folder_id:
-        raise ValueError(
-            "Attempted to download the configured folder ID as a file. "
-            "Only the individual PDF/DOCX/TXT file ID should be downloaded."
-        )
+        raise ValueError("A folder ID cannot be downloaded as a document file.")
 
     metadata = service.files().get(
-        fileId=file_id,
-        fields="id,name,mimeType",
-        supportsAllDrives=True
+        fileId=file_id, fields="id,name,mimeType", supportsAllDrives=True
     ).execute()
     if metadata.get("mimeType") == "application/vnd.google-apps.folder":
-        raise ValueError(
-            f"'{metadata.get('name', file_id)}' is a folder, not a document."
-        )
+        raise ValueError(f"'{metadata.get('name', file_id)}' is a folder, not a document.")
 
     from googleapiclient.http import MediaIoBaseDownload
     destination = Path(destination)
     temporary_path = destination.with_name(destination.name + ".download-tmp")
     try:
-        request = service.files().get_media(
-            fileId=file_id,
-            supportsAllDrives=True
-        )
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
         with open(temporary_path, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, request)
             done = False
@@ -186,23 +171,18 @@ def _drive_upload(local_path, drive_name, existing_id=None, progress=None,
 
     from googleapiclient.http import MediaFileUpload
     media = MediaFileUpload(
-        str(local_path),
-        mimetype="application/octet-stream",
-        resumable=True,
-        chunksize=1024 * 1024
+        str(local_path), mimetype="application/octet-stream",
+        resumable=True, chunksize=1024 * 1024
     )
     if existing_id:
         request = service.files().update(
-            fileId=existing_id,
-            body={"name": drive_name},
-            media_body=media,
-            fields="id,name"
+            fileId=existing_id, body={"name": drive_name},
+            media_body=media, fields="id,name"
         )
     else:
         request = service.files().create(
             body={"name": drive_name, "parents": [_drive_folder_id]},
-            media_body=media,
-            fields="id,name"
+            media_body=media, fields="id,name"
         )
 
     response = None
@@ -224,10 +204,8 @@ def _drive_delete(file_id):
 
 
 def _sync_from_drive():
-    """Download saved state and all supported documents from the configured Drive folder.
+    """Import pre-existing and app-managed documents from the configured Drive folder.
 
-    Files uploaded from this app use a doc__ prefix; documents that were already
-    present in Drive before the app was connected are also imported.
     Returns True if a source document was newly downloaded or replaced.
     """
     global _drive_last_error
@@ -235,93 +213,72 @@ def _sync_from_drive():
     service = _drive_client()
     if service is None:
         return False
-
     try:
         files = _drive_list()
     except Exception as exc:
         _drive_last_error = (
             "Cannot list Google Drive folder. Confirm GOOGLE_DRIVE_FOLDER_ID is "
-            "the folder ID (not a file ID), and share this folder with the "
-            "service-account client_email as Editor. Details: " + str(exc)
+            "the folder ID (not a PDF ID) and share it with the service account "
+            "as Editor. Details: " + str(exc)
         )
         print(_drive_last_error)
         return False
 
-    by_name = {f["name"]: f for f in files}
-    # Restore saved index and metadata if present.
-    for name, dest in [
+    by_name = {item["name"]: item for item in files}
+    for name, destination in [
         ("qwivaro_faiss.index", INDEX_PATH),
         ("qwivaro_chunks.json", CHUNKS_PATH),
         ("qwivaro_manifest.json", MANIFEST_PATH),
     ]:
         if name in by_name:
             try:
-                _drive_download(by_name[name]["id"], dest)
+                _drive_download(by_name[name]["id"], destination)
             except Exception as exc:
                 print(f"Could not restore {name}: {exc}")
 
-    # Import both app-managed and pre-existing PDFs/DOCX/TXT files. If both
-    # exist with the same original name, prefer the app-managed doc__ copy.
+    # Import files that were already in the folder before the app was connected,
+    # plus files uploaded through this app with the doc__ prefix.
     source_files = {}
     for item in files:
         remote_name = item.get("name", "")
-        if remote_name.startswith("doc__"):
-            original = remote_name[5:]
-            preferred = True
-        else:
-            original = remote_name
-            preferred = False
-        if Path(original).suffix.lower() not in ALLOWED_EXTENSIONS:
+        is_app_copy = remote_name.startswith("doc__")
+        original_name = remote_name[5:] if is_app_copy else remote_name
+        if Path(original_name).suffix.lower() not in ALLOWED_EXTENSIONS:
             continue
-        previous = source_files.get(original)
-        if previous is None or preferred:
-            source_files[original] = item
+        previous = source_files.get(original_name)
+        if previous is None or is_app_copy:
+            source_files[original_name] = item
 
-    documents_changed = False
-    for original, item in source_files.items():
-        destination = DOCS_DIR / original
+    changed = False
+    for original_name, item in source_files.items():
+        destination = DOCS_DIR / original_name
         remote_size = int(item.get("size") or 0)
-        needs_download = (
-            not destination.exists()
-            or (remote_size > 0 and destination.stat().st_size != remote_size)
-        )
-        if not needs_download:
+        if destination.exists() and (not remote_size or destination.stat().st_size == remote_size):
             continue
         try:
-            if item.get("id") == _drive_folder_id:
-                raise ValueError(
-                    "Google Drive returned the folder ID as a file. Verify "
-                    "GOOGLE_DRIVE_FOLDER_ID and folder sharing permissions."
-                )
             _drive_download(item["id"], destination)
-            documents_changed = True
-            print(f"Restored existing Drive document: {original}")
+            changed = True
+            print(f"Restored existing Drive document: {original_name}")
         except Exception as exc:
-            message = (
-                f"Could not download '{original}' from Drive. Verify that the "
-                "service account has access to the file and that it is a real "
-                "PDF/DOCX/TXT file. Details: " + str(exc)
-            )
+            message = f"Could not download '{original_name}' from Drive: {exc}"
             _drive_last_error = (_drive_last_error + " " + message).strip()
             print(message)
-
-    return documents_changed
+    return changed
 
 
 def _drive_save_state():
+    global _drive_last_error
     service = _drive_client()
     if service is None:
         return
     try:
         files = _drive_list()
     except Exception as exc:
-        print(
-            "Could not list Google Drive folder; check the folder ID and share "
-            "it with the service-account client_email: " + str(exc)
-        )
+        _drive_last_error = "Could not access Google Drive folder: " + str(exc)
+        print(_drive_last_error)
         return
 
-    by_name = {f["name"]: f for f in files}
+    by_name = {item["name"]: item for item in files}
     for local_path, drive_name in [
         (INDEX_PATH, "qwivaro_faiss.index"),
         (CHUNKS_PATH, "qwivaro_chunks.json"),
@@ -331,11 +288,12 @@ def _drive_save_state():
             try:
                 _drive_upload(local_path, drive_name, by_name.get(drive_name, {}).get("id"))
             except Exception as exc:
-                print(f"Could not save {drive_name} to Google Drive: {exc}")
+                _drive_last_error = f"Could not save {drive_name} to Google Drive: {exc}"
+                print(_drive_last_error)
 
 
 def _extract_text(path: Path) -> str:
-    """Extract readable text from text-based PDF, DOCX, and TXT files."""
+    """Extract searchable text from text PDFs, Word documents and text files."""
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         try:
@@ -345,22 +303,18 @@ def _extract_text(path: Path) -> str:
                     reader.decrypt("")
                 except Exception as exc:
                     raise ValueError("PDF is password-protected and cannot be read.") from exc
-
             pieces = []
             for page_no, page in enumerate(reader.pages, start=1):
                 try:
-                    txt = page.extract_text(extraction_mode="layout") or ""
+                    text = page.extract_text(extraction_mode="layout") or ""
                 except TypeError:
-                    # Compatibility with older pypdf releases.
-                    txt = page.extract_text() or ""
-                if txt.strip():
-                    pieces.append(f"[Page {page_no}]\n{txt.strip()}")
-
+                    text = page.extract_text() or ""
+                if text.strip():
+                    pieces.append(f"[Page {page_no}]\n{text.strip()}")
             extracted = "\n\n".join(pieces).strip()
             if not extracted:
                 raise ValueError(
-                    "No selectable text was found in this PDF. It may be a scanned/image-only PDF; "
-                    "OCR is required for that file."
+                    "No selectable text was found in this PDF. It may be scanned/image-only; OCR is required."
                 )
             return extracted
         except ValueError:
@@ -369,7 +323,7 @@ def _extract_text(path: Path) -> str:
             raise ValueError(f"Could not parse this PDF: {exc}") from exc
     if suffix == ".docx":
         doc = Document(str(path))
-        pieces = [p.text for p in doc.paragraphs if p.text.strip()]
+        pieces = [paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()]
         for table in doc.tables:
             for row in table.rows:
                 pieces.append(" | ".join(cell.text for cell in row.cells))
@@ -410,107 +364,74 @@ def _save_manifest():
 
 
 def _build_index(progress=None):
-    """Extract documents and rebuild the semantic search index with progress updates."""
+    """Extract documents, create embeddings in batches, and update the progress bar."""
     global _index, _chunks
     all_chunks = []
     manifest_files = []
-    paths = [
-        path for path in sorted(DOCS_DIR.iterdir())
-        if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS
-    ]
+    paths = [p for p in sorted(DOCS_DIR.iterdir())
+             if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
 
     if progress is not None:
         progress(0.38, desc=f"Reading text from {len(paths)} document(s)...")
-
     for i, path in enumerate(paths, start=1):
         try:
             text = _extract_text(path)
             if not text.strip():
-                manifest_files.append({
-                    "name": path.name,
-                    "status": "No extractable text",
-                    "chunks": 0
-                })
+                manifest_files.append({"name": path.name, "status": "No extractable text", "chunks": 0})
                 continue
-            parts = _split_text(text)
-            for number, part in enumerate(parts, start=1):
-                all_chunks.append({
-                    "source": path.name,
-                    "chunk_id": number,
-                    "text": part
-                })
+            chunks = _split_text(text)
+            for number, chunk in enumerate(chunks, start=1):
+                all_chunks.append({"source": path.name, "chunk_id": number, "text": chunk})
             manifest_files.append({
-                "name": path.name,
-                "status": "Reading text complete",
-                "chunks": len(parts),
+                "name": path.name, "status": "Reading text complete", "chunks": len(chunks),
                 "size_bytes": path.stat().st_size
             })
         except Exception as exc:
-            manifest_files.append({
-                "name": path.name,
-                "status": f"Error: {exc}",
-                "chunks": 0
-            })
+            manifest_files.append({"name": path.name, "status": f"Error: {exc}", "chunks": 0})
         if progress is not None:
-            progress(
-                0.38 + 0.17 * (i / max(1, len(paths))),
-                desc=f"Reading document {i}/{len(paths)}: {path.name}"
-            )
+            progress(0.38 + 0.17 * i / max(1, len(paths)),
+                     desc=f"Reading document {i}/{len(paths)}: {path.name}")
 
     _chunks = all_chunks
     _manifest = {"files": manifest_files}
     _save_manifest()
-
     if not all_chunks:
         _index = None
-        if INDEX_PATH.exists():
-            INDEX_PATH.unlink()
-        if CHUNKS_PATH.exists():
-            CHUNKS_PATH.unlink()
-        if progress is not None:
-            progress(0.96, desc="No searchable text found; saving document statuses...")
+        INDEX_PATH.unlink(missing_ok=True)
+        CHUNKS_PATH.unlink(missing_ok=True)
         _drive_save_state()
+        if progress is not None:
+            progress(1.0, desc="No searchable text found; check document status.")
         return
 
     if progress is not None:
         progress(0.57, desc=f"Loading embedding model for {len(all_chunks)} text sections...")
     embedding_model = _get_embedding_model()
-
-    # Encode in batches so the UI progress advances during long indexing runs,
-    # and the app doesn't need to hold a second full-size batch in memory.
-    text_items = [c["text"] for c in all_chunks]
+    texts = [chunk["text"] for chunk in all_chunks]
     batch_size = 8
-    embedding_batches = []
-    total_batches = max(1, (len(text_items) + batch_size - 1) // batch_size)
-    for batch_number, start in enumerate(range(0, len(text_items), batch_size), start=1):
+    total_batches = max(1, (len(texts) + batch_size - 1) // batch_size)
+    vectors = []
+    for batch_number, start_at in enumerate(range(0, len(texts), batch_size), start=1):
         batch_vectors = embedding_model.encode(
-            text_items[start:start + batch_size],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False
+            texts[start_at:start_at + batch_size], convert_to_numpy=True,
+            normalize_embeddings=True, show_progress_bar=False
         ).astype("float32")
-        embedding_batches.append(batch_vectors)
+        vectors.append(batch_vectors)
         if progress is not None:
-            fraction = batch_number / total_batches
-            progress(
-                0.58 + 0.32 * fraction,
-                desc=f"Creating search index: batch {batch_number}/{total_batches}"
-            )
+            progress(0.58 + 0.32 * batch_number / total_batches,
+                     desc=f"Creating search index: batch {batch_number}/{total_batches}")
 
-    embs = np.concatenate(embedding_batches, axis=0) if embedding_batches else np.empty((0, 0), dtype="float32")
-    _index = faiss.IndexFlatIP(embs.shape[1])
-    _index.add(embs)
+    embeddings = np.concatenate(vectors, axis=0).astype("float32")
+    _index = faiss.IndexFlatIP(embeddings.shape[1])
+    _index.add(embeddings)
     faiss.write_index(_index, str(INDEX_PATH))
     CHUNKS_PATH.write_text(json.dumps(_chunks, ensure_ascii=False), encoding="utf-8")
-
-    # Mark successfully extracted documents as indexed only after embeddings are ready.
     for entry in _manifest["files"]:
         if entry.get("chunks", 0) > 0 and entry.get("status") == "Reading text complete":
             entry["status"] = "Indexed"
     _save_manifest()
-
     if progress is not None:
-        progress(0.94, desc="Saving index and syncing Google Drive...")
+        progress(0.94, desc="Saving search index and syncing Google Drive...")
     _drive_save_state()
     if progress is not None:
         progress(1.0, desc="Knowledge base ready.")
@@ -521,14 +442,6 @@ def _get_embedding_model():
     if _embedding_model is None:
         _embedding_model = SentenceTransformer(EMBEDDING_MODEL, device="cuda" if torch.cuda.is_available() else "cpu")
     return _embedding_model
-
-
-def _documents_table_rows():
-    """Return row arrays instead of dictionaries for the Gradio Dataframe."""
-    return [
-        [item["Filename"], item["Size (KB)"], item["Status"]]
-        for item in _documents_table()
-    ]
 
 
 def _load_saved_index():
@@ -617,13 +530,11 @@ def _answer(question: str, top_k: int = TOP_K):
 
 
 def _save_uploaded(files, progress=None):
-    """Save selected documents and report copy, Drive-upload and indexing progress."""
+    """Store selected documents and report Drive-transfer/indexing progress."""
     if not files:
         return "Choose one or more PDF, DOCX, or TXT files first.", _documents_table()
-
     added, skipped, errors = [], [], []
     file_count = len(files)
-
     if progress is not None:
         progress(0.03, desc="Preparing selected documents...")
 
@@ -631,27 +542,23 @@ def _save_uploaded(files, progress=None):
         for i, file_obj in enumerate(files, start=1):
             source_path = Path(getattr(file_obj, "name", str(file_obj)))
             if progress is not None:
-                progress(
-                    0.05 + 0.15 * ((i - 1) / max(1, file_count)),
-                    desc=f"Checking file {i}/{file_count}: {source_path.name}"
-                )
+                progress(0.05 + 0.15 * (i - 1) / max(1, file_count),
+                         desc=f"Checking file {i}/{file_count}: {source_path.name}")
             if source_path.suffix.lower() not in ALLOWED_EXTENSIONS:
                 errors.append(f"{source_path.name}: unsupported file type")
                 continue
             try:
-                file_size = source_path.stat().st_size
+                size = source_path.stat().st_size
             except OSError as exc:
-                errors.append(f"{source_path.name}: cannot read selected file: {exc}")
+                errors.append(f"{source_path.name}: cannot read file: {exc}")
                 continue
-            if file_size > MAX_FILE_MB * 1024 * 1024:
+            if size > MAX_FILE_MB * 1024 * 1024:
                 errors.append(f"{source_path.name}: exceeds {MAX_FILE_MB} MB limit")
                 continue
-
             target = DOCS_DIR / source_path.name
             if target.exists():
                 skipped.append(source_path.name)
                 continue
-
             try:
                 shutil.copy2(source_path, target)
                 added.append(target.name)
@@ -659,27 +566,18 @@ def _save_uploaded(files, progress=None):
                 errors.append(f"{source_path.name}: could not copy file: {exc}")
                 continue
 
-            # Drive upload is resumable, so progress reflects bytes sent to Drive.
-            service = _drive_client()
-            if service is not None:
+            if _drive_client() is not None:
                 try:
-                    file_start = 0.20 + 0.16 * ((i - 1) / max(1, file_count))
-                    file_end = 0.20 + 0.16 * (i / max(1, file_count))
                     _drive_upload(
-                        target,
-                        "doc__" + target.name,
-                        progress=progress,
-                        progress_start=file_start,
-                        progress_end=file_end
+                        target, "doc__" + target.name, progress=progress,
+                        progress_start=0.20 + 0.16 * (i - 1) / max(1, file_count),
+                        progress_end=0.20 + 0.16 * i / max(1, file_count)
                     )
                 except Exception as exc:
                     errors.append(
-                        f"Google Drive save failed for {target.name}. Verify "
-                        "GOOGLE_DRIVE_FOLDER_ID and share the folder with the "
-                        "service-account client_email. The local file will still be indexed. "
-                        f"Details: {exc}"
+                        f"Google Drive save failed for {target.name}. Check the folder ID and "
+                        f"service-account Editor access. Local indexing will continue. Details: {exc}"
                     )
-
         if added:
             _build_index(progress=progress)
         elif progress is not None:
@@ -692,12 +590,11 @@ def _save_uploaded(files, progress=None):
         messages.append("Skipped duplicate filenames (delete the existing file first to replace it): " + ", ".join(skipped))
     if errors:
         messages.append("Warnings / errors: " + "; ".join(errors))
-
-    status_map = {item.get("name"): item.get("status") for item in _manifest.get("files", [])}
+    statuses = {entry.get("name"): entry.get("status") for entry in _manifest.get("files", [])}
     for filename in added:
-        file_status = status_map.get(filename)
-        if file_status and file_status != "Indexed":
-            messages.append(f"{filename}: {file_status}")
+        status = statuses.get(filename)
+        if status and status != "Indexed":
+            messages.append(f"{filename}: {status}")
     if not messages:
         messages.append("No changes made.")
     if progress is not None:
@@ -714,12 +611,19 @@ def _delete_document(filename):
         if not target.exists():
             return "Document not found.", _documents_table()
         target.unlink()
-        # Remove matching Drive source file (exact prefixed name)
+        # Remove both the app-managed Drive copy and an original file that was
+        # already present in the knowledge-base folder before the app was connected.
         service = _drive_client()
         if service is not None:
-            for item in _drive_list():
-                if item["name"] == "doc__" + filename:
-                    _drive_delete(item["id"])
+            try:
+                for item in _drive_list():
+                    if item.get("name") in {"doc__" + filename, filename}:
+                        _drive_delete(item["id"])
+            except Exception as exc:
+                # Local deletion/index refresh should still complete, but surface the warning.
+                global _drive_last_error
+                _drive_last_error = f"Local document deleted, but Drive cleanup failed: {exc}"
+                print(_drive_last_error)
         _build_index()
     return f"Deleted {filename} and refreshed the search index.", _documents_table()
 
@@ -741,31 +645,36 @@ def _documents_table():
     return files
 
 
+def _documents_table_rows():
+    """Row-array format for any optional table consumers."""
+    return [[row["Filename"], row["Size (KB)"], row["Status"]] for row in _documents_table()]
+
+
 def _refresh_from_drive():
     global _drive_last_error
     with _lock:
-        documents_changed = _sync_from_drive()
+        changed = _sync_from_drive()
         _load_manifest()
-        if documents_changed:
+        if changed:
             _build_index()
         else:
             _load_saved_index()
-        status = (
-            "Google Drive sync completed and the local index is ready."
-            if not _drive_last_error
-            else "Google Drive sync issue: " + _drive_last_error
+        message = (
+            "Google Drive sync complete; local search index is ready."
+            if not _drive_last_error else "Google Drive sync issue: " + _drive_last_error
         )
-    return _documents_table_rows(), status
+    return _documents_table(), message
 
 
 def _initialise():
     with _lock:
-        documents_changed = _sync_from_drive()
+        changed = _sync_from_drive()
         _load_manifest()
-        if documents_changed:
+        if changed:
             _build_index()
         else:
             _load_saved_index()
+
 
 
 def chat_fn(message, history):
@@ -777,8 +686,8 @@ def chat_fn(message, history):
 
 
 def admin_upload(files, progress=gr.Progress(track_tqdm=True)):
-    message, records = _save_uploaded(files, progress=progress)
-    return message, records
+    message, _records = _save_uploaded(files, progress=progress)
+    return message, _documents_table()
 
 
 def admin_delete(filename):
@@ -787,10 +696,10 @@ def admin_delete(filename):
 
 
 def admin_refresh(progress=gr.Progress(track_tqdm=True)):
-    _records, message = _refresh_from_drive()
+    records, message = _refresh_from_drive()
     if progress is not None:
         progress(1.0, desc="Drive sync complete.")
-    return message, _documents_table()
+    return message, records
 
 
 # Initialise storage/index on app startup.
@@ -841,17 +750,16 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple"), css=
                     height=150
                 )
                 gr.Markdown(
-                    "Files are sent to this app when selected. The progress indicator tracks "
-                    "Drive transfer (when configured), text extraction and indexing."
+                    "Select the documents, then start processing. Progress covers Drive transfer "
+                    "(when configured), text extraction and search indexing."
                 )
             with gr.Column(scale=2, min_width=240):
-                gr.Markdown("### Add to knowledge base\nAfter selecting files, start processing. Duplicate names are skipped.")
+                gr.Markdown("### Add to knowledge base\nDuplicate filenames are skipped to prevent accidental replacement.")
                 upload_button = gr.Button("Upload and index documents", variant="primary", size="lg")
                 refresh_button = gr.Button("↻ Sync existing files from Google Drive", variant="secondary")
+
         upload_status = gr.Textbox(
-            label="Activity and document status",
-            interactive=False,
-            lines=3,
+            label="Activity and document status", interactive=False, lines=3,
             placeholder="Upload progress and results will appear here..."
         )
         documents_state = gr.State(_documents_table())
@@ -871,10 +779,7 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple"), css=
                         size_kb = record.get("Size (KB)", 0)
                         doc_status = record.get("Status", "Stored")
                         with gr.Row(equal_height=True, elem_classes=["document-card"]):
-                            gr.HTML(
-                                "<div class='doc-file-icon'>📄</div>",
-                                elem_classes=["doc-icon-wrap"]
-                            )
+                            gr.HTML("<div class='doc-file-icon'>📄</div>", elem_classes=["doc-icon-wrap"])
                             gr.HTML(
                                 "<div class='doc-file-details'>"
                                 f"<div class='doc-file-name'>{html.escape(str(filename))}</div>"
@@ -882,28 +787,19 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(primary_hue="purple"), css=
                                 f"{html.escape(str(doc_status))}</div></div>",
                                 elem_classes=["doc-details-wrap"]
                             )
-                            delete_doc_button = gr.Button(
-                                "Delete", variant="stop", size="sm"
-                            )
-                            delete_doc_button.click(
+                            remove_button = gr.Button("Delete", variant="stop", size="sm")
+                            remove_button.click(
                                 fn=lambda name=filename: admin_delete(name),
                                 inputs=[],
                                 outputs=[upload_status, documents_state]
                             )
+
         upload_button.click(
-            admin_upload,
-            inputs=[upload_input],
-            outputs=[upload_status, documents_state],
+            admin_upload, inputs=[upload_input], outputs=[upload_status, documents_state],
             show_progress="full"
-        ).then(
-            lambda: None,
-            outputs=[upload_input]
-        )
+        ).then(lambda: None, outputs=[upload_input])
         refresh_button.click(
-            admin_refresh,
-            inputs=[],
-            outputs=[upload_status, documents_state],
-            show_progress="full"
+            admin_refresh, inputs=[], outputs=[upload_status, documents_state], show_progress="full"
         )
     gr.Markdown(
         "---\n"
