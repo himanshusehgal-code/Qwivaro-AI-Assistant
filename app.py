@@ -47,14 +47,19 @@ _manifest = {"files": []}
 _drive = None
 _drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
 _service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+_drive_last_error = ""
 
 
 def _drive_client():
     """Return authenticated Drive API client, or None when Drive is not configured."""
-    global _drive
+    global _drive, _drive_last_error
     if _drive is not None:
         return _drive
     if not _drive_folder_id or not _service_account_json:
+        _drive_last_error = (
+            "Google Drive is not configured. Set GOOGLE_DRIVE_FOLDER_ID and "
+            "GOOGLE_SERVICE_ACCOUNT_JSON in Render Environment."
+        )
         return None
     try:
         from google.oauth2 import service_account
@@ -69,7 +74,8 @@ def _drive_client():
         _drive = build("drive", "v3", credentials=creds, cache_discovery=False)
         return _drive
     except Exception as exc:
-        print(f"Google Drive setup failed; using local storage only: {exc}")
+        _drive_last_error = f"Google Drive credentials setup failed: {exc}"
+        print(_drive_last_error)
         return None
 
 
@@ -146,6 +152,8 @@ def _sync_from_drive():
     present in Drive before the app was connected are also imported.
     Returns True if a source document was newly downloaded or replaced.
     """
+    global _drive_last_error
+    _drive_last_error = ""
     service = _drive_client()
     if service is None:
         return False
@@ -153,10 +161,12 @@ def _sync_from_drive():
     try:
         files = _drive_list()
     except Exception as exc:
-        print(
-            "Google Drive sync failed. Check GOOGLE_DRIVE_FOLDER_ID and share "
-            "the folder with the service-account client_email: " + str(exc)
+        _drive_last_error = (
+            "Cannot list Google Drive folder. Confirm GOOGLE_DRIVE_FOLDER_ID is "
+            "the folder ID (not a file ID), and share this folder with the "
+            "service-account client_email as Editor. Details: " + str(exc)
         )
+        print(_drive_last_error)
         return False
 
     by_name = {f["name"]: f for f in files}
@@ -209,7 +219,13 @@ def _sync_from_drive():
             documents_changed = True
             print(f"Restored existing Drive document: {original}")
         except Exception as exc:
-            print(f"Could not restore document {original}: {exc}")
+            message = (
+                f"Could not download '{original}' from Drive. Verify that the "
+                "service account has access to the file and that it is a real "
+                "PDF/DOCX/TXT file. Details: " + str(exc)
+            )
+            _drive_last_error = (_drive_last_error + " " + message).strip()
+            print(message)
 
     return documents_changed
 
@@ -527,6 +543,7 @@ def _documents_table():
 
 
 def _refresh_from_drive():
+    global _drive_last_error
     with _lock:
         documents_changed = _sync_from_drive()
         _load_manifest()
@@ -534,7 +551,12 @@ def _refresh_from_drive():
             _build_index()
         else:
             _load_saved_index()
-    return _documents_table(), "Google Drive sync checked for existing PDF, DOCX and TXT files."
+        status = (
+            "Google Drive sync completed and the local index is ready."
+            if not _drive_last_error
+            else "Google Drive sync issue: " + _drive_last_error
+        )
+    return _documents_table_rows(), status
 
 
 def _initialise():
