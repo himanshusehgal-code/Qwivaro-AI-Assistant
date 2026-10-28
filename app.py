@@ -638,10 +638,21 @@ def _refresh_from_drive():
 
 
 def _initialise():
+    """Restore the saved lightweight index on startup; don't re-parse every PDF at boot."""
+    global _chunks
     with _lock:
         _sync_from_drive()
         _load_manifest()
-        _build_index()
+        if CHUNKS_PATH.exists():
+            try:
+                cached_chunks = json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
+                _chunks = cached_chunks if isinstance(cached_chunks, list) else []
+            except Exception as exc:
+                _chunks = []
+                print(f"Could not restore saved search index: {exc}")
+        else:
+            _chunks = []
+            print("No saved search index found. Use Knowledge Base (Admin) → Sync existing files from Google Drive to build it.")
 
 
 
