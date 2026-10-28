@@ -278,8 +278,6 @@ def _drive_save_state(progress=None):
         print(_drive_last_error)
 
 
-def _extract_text(
-
 def _extract_text(path: Path) -> str:
     """Extract searchable text from text PDFs, Word documents and text files."""
     suffix = path.suffix.lower()
